@@ -1,0 +1,8 @@
+# environment — contains secrets, never commit
+.env
+
+# build output
+bin/
+
+# macOS
+.DS_Store
