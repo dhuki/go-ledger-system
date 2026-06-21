@@ -1,290 +1,16 @@
 package integration
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
-
-	"github.com/dhuki/go-ledger-system/internal/adapter/http/model"
 	"github.com/google/uuid"
 )
-
-const (
-	baseUrl      = "http://localhost:8080"
-	transferPath = "/api/v1/transfer"
-)
-
-// seed is the known-good balance for each account before every test.
-var (
-	seed = map[string]int64{
-		"ACC-001": 10_000_000,
-		"ACC-002": 5_000_000,
-		"ACC-003": 0,
-	}
-
-	baseResponse model.BaseResponse
-)
-
-// ----------------------------------------------------------------------------
-// Infrastructure helpers
-// ----------------------------------------------------------------------------
-
-// openDB opens a direct PostgreSQL connection to the docker database for test
-// setup and assertions. It skips the test when LEDGER_TEST_DSN is not set.
-func openDB(t *testing.T) *sql.DB {
-	t.Helper()
-	dsn := os.Getenv("LEDGER_TEST_DSN")
-	if dsn == "" {
-		t.Skip("LEDGER_TEST_DSN not set; skipping integration test")
-	}
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
-// checkServer skips the test when the service at baseUrl is not reachable.
-func checkServer(t *testing.T) {
-	t.Helper()
-	resp, err := http.Get(baseUrl + "/api/v1/health")
-	if err != nil || resp.StatusCode >= 500 {
-		t.Skipf("service at %s not reachable; skipping integration test", baseUrl)
-	}
-	resp.Body.Close()
-}
-
-// resetState truncates all transactional tables and re-seeds the three accounts
-// to their known-good balances. Called at the start of every test.
-func resetState(t *testing.T, db *sql.DB) {
-	t.Helper()
-	if _, err := db.Exec(`TRUNCATE ledger_entries, transaction_transfers RESTART IDENTITY CASCADE`); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
-	for number, balance := range seed {
-		if _, err := db.Exec(
-			`UPDATE account_balances SET balance = $1 WHERE account_number = $2`,
-			balance, number,
-		); err != nil {
-			t.Fatalf("reset balance %s: %v", number, err)
-		}
-	}
-}
-
-// queryBalance returns the balance for an account and false when the account
-// does not exist, letting callers record a FAIL check and still reach r.print().
-func queryBalance(db *sql.DB, account string) (int64, bool) {
-	var balance int64
-	err := db.QueryRow(`SELECT balance FROM account_balances WHERE account_number = $1`, account).Scan(&balance)
-	if err != nil {
-		return 0, false
-	}
-	return balance, true
-}
-
-func scalarInt(t *testing.T, db *sql.DB, query string, args ...any) int64 {
-	t.Helper()
-	var n int64
-	if err := db.QueryRow(query, args...).Scan(&n); err != nil {
-		t.Fatalf("scalarInt %q: %v", query, err)
-	}
-	return n
-}
-
-// ----------------------------------------------------------------------------
-// HTTP helper
-// ----------------------------------------------------------------------------
-
-// postTransfer sends one transfer request and returns the HTTP status code and
-// the raw response body so callers can include it in the test report.
-func postTransfer(t *testing.T, idempotencyKey, sender, receiver string, amount int64) (int, model.BaseResponse) {
-	t.Helper()
-
-	reqBody, err := json.Marshal(model.CreateTransferRequest{
-		SenderAccount:   sender,
-		ReceiverAccount: receiver,
-		Amount:          amount,
-	})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s%s", baseUrl, transferPath), bytes.NewReader(reqBody))
-	if err != nil {
-		t.Fatalf("Failed to Create Request: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Trace-ID", uuid.NewString())
-	if idempotencyKey != "" {
-		req.Header.Set("X-Idempotency-Key", idempotencyKey)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to Do request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if err := json.NewDecoder(resp.Body).Decode(&baseResponse); err != nil {
-		t.Fatalf("Failed to decode rseponse: %v", err)
-	}
-
-	return resp.StatusCode, baseResponse
-}
-
-// ----------------------------------------------------------------------------
-// Report helpers
-// ----------------------------------------------------------------------------
-
-// caseReport collects inputs, the raw HTTP response, and validation checks for
-// a single test case, then prints a structured summary to stdout.
-type caseReport struct {
-	t            *testing.T
-	name         string
-	inputs       []inputRow
-	respStatus   int
-	respBody     model.BaseResponse
-	wantRespBody string // optional expected body snippet for display
-	checks       []checkRow
-}
-
-type inputRow struct{ label, value string }
-type checkRow struct {
-	label string
-	got   string
-	want  string
-	pass  bool
-}
-
-func newReport(t *testing.T, name string) *caseReport {
-	t.Helper()
-	return &caseReport{t: t, name: name}
-}
-
-func (r *caseReport) input(label, value string) {
-	r.inputs = append(r.inputs, inputRow{label, value})
-}
-
-// setResponse records the raw HTTP status and body returned by the server.
-func (r *caseReport) setResponse(status int, body model.BaseResponse) {
-	r.respStatus = status
-	r.respBody = body
-}
-
-// expectResponse sets the body string shown in the EXPECTED column of the
-// response section. Use a representative snippet, not an exact match.
-func (r *caseReport) expectResponse(body string) {
-	r.wantRespBody = body
-}
-
-func (r *caseReport) check(label, got, want string) {
-	pass := got == want
-	r.checks = append(r.checks, checkRow{label: label, got: got, want: want, pass: pass})
-	if !pass {
-		r.t.Fail()
-	}
-}
-
-func (r *caseReport) checkInt(label string, got, want int64) {
-	r.check(label, fmt.Sprintf("%d", got), fmt.Sprintf("%d", want))
-}
-
-func (r *caseReport) checkHTTP(got, want int) {
-	r.check("http_status", fmt.Sprintf("%d", got), fmt.Sprintf("%d", want))
-}
-
-func (r *caseReport) checkMessage(got, want string) {
-	r.check("response.message", got, want)
-}
-
-func (r *caseReport) print() {
-	const w = 68
-	sep := strings.Repeat("-", w)
-	verdict := func(pass bool) string {
-		if pass {
-			return "PASS"
-		}
-		return "FAIL"
-	}
-
-	allPass := true
-	for _, c := range r.checks {
-		if !c.pass {
-			allPass = false
-			break
-		}
-	}
-
-	fmt.Println(sep)
-	fmt.Printf("CASE: %s\n", r.name)
-	fmt.Println()
-
-	fmt.Println("  INPUT:")
-	for _, in := range r.inputs {
-		fmt.Printf("    %-20s = %s\n", in.label, in.value)
-	}
-	fmt.Println()
-
-	if r.respBody.Message != "" || r.respStatus != 0 {
-		fmt.Println("  RESPONSE:")
-		fmt.Printf("    %-20s   got: %-30s  expected: %s\n",
-			"http_status",
-			fmt.Sprintf("%d", r.respStatus),
-			func() string {
-				for _, c := range r.checks {
-					if c.label == "http_status" {
-						return c.want
-					}
-				}
-				return "-"
-			}(),
-		)
-		fmt.Printf("    %-20s   got: %-30s  expected: %s\n",
-			"body",
-			truncate(r.respBody.Message, 50),
-			func() string {
-				if r.wantRespBody != "" {
-					return r.wantRespBody
-				}
-				return "-"
-			}(),
-		)
-		fmt.Println()
-	}
-
-	fmt.Println("  VALIDATION:")
-	fmt.Printf("    %-32s %-18s %-18s %s\n", "case", "got", "expected", "result")
-	for _, c := range r.checks {
-		fmt.Printf("    %-32s %-18s %-18s %s\n", c.label, c.got, c.want, verdict(c.pass))
-	}
-	fmt.Println()
-	fmt.Printf("  OVERALL: %s\n", verdict(allPass))
-	fmt.Println(sep)
-}
-
-// truncate shortens s to at most n runes, appending "…" when cut.
-func truncate(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "..."
-}
 
 // ----------------------------------------------------------------------------
 // Tests
@@ -298,53 +24,57 @@ func TestIntegration_Validation(t *testing.T) {
 	resetState(t, db)
 
 	cases := []struct {
-		name            string
-		sender          string
-		receiver        string
-		amount          int64
-		wantStatus      int
-		wantMessage     string // expected BaseResponse.Message
-		wantTransfers   int64
-		wantSenderInDB  bool   // false = sender must not exist in DB
-		wantSenderBal   int64  // only checked when wantSenderInDB == true
-		wantReceiverBal string // account number to assert
-		wantRecBal      int64
+		name          string
+		sender        string
+		receiver      string
+		amount        int64
+		wantStatus    int
+		wantMessage   string // expected BaseResponse.Message
+		wantTransfers int64
+		wantSenderBal int64
+		wantRecBal    int64
 	}{
 		{
-			name:            "zero amount transfer",
-			sender:          "ACC-001", receiver: "ACC-002", amount: 0,
-			wantStatus:      http.StatusBadRequest,
-			wantMessage:     "amount must be greater than zero",
-			wantTransfers:   0,
-			wantSenderInDB:  true,
-			wantSenderBal:   seed["ACC-001"], wantReceiverBal: "ACC-002", wantRecBal: seed["ACC-002"],
+			name:   "zero amount transfer",
+			sender: "ACC-001", receiver: "ACC-002", amount: 0,
+			wantStatus:    http.StatusBadRequest,
+			wantMessage:   "amount must be greater than zero",
+			wantTransfers: 0,
+			wantSenderBal: seed["ACC-001"], wantRecBal: seed["ACC-002"],
 		},
 		{
-			name:            "self transfer",
-			sender:          "ACC-001", receiver: "ACC-001", amount: 100,
-			wantStatus:      http.StatusBadRequest,
-			wantMessage:     "cannot transfer to the same account",
-			wantTransfers:   0,
-			wantSenderInDB:  true,
-			wantSenderBal:   seed["ACC-001"], wantReceiverBal: "ACC-001", wantRecBal: seed["ACC-001"],
+			name:   "self transfer",
+			sender: "ACC-001", receiver: "ACC-001", amount: 100,
+			wantStatus:    http.StatusBadRequest,
+			wantMessage:   "cannot transfer to the same account",
+			wantTransfers: 0,
+			wantSenderBal: seed["ACC-001"], wantRecBal: seed["ACC-001"],
 		},
 		{
-			name:            "sender not found",
-			sender:          "ACC-999", receiver: "ACC-002", amount: 100,
-			wantStatus:      http.StatusNotFound,
-			wantMessage:     "account not found",
-			wantTransfers:   0,
-			wantSenderInDB:  false, // ACC-999 must not exist in DB — not-found is the PASS expectation
-			wantReceiverBal: "ACC-002", wantRecBal: seed["ACC-002"],
+			name:   "sender not found",
+			sender: "ACC-999", receiver: "ACC-002", amount: 100,
+			wantStatus:    http.StatusNotFound,
+			wantMessage:   "account not found",
+			wantTransfers: 0,
+			wantSenderBal: 0,
+			wantRecBal:    seed["ACC-002"],
 		},
 		{
-			name:            "insufficient balance",
-			sender:          "ACC-003", receiver: "ACC-001", amount: 1,
-			wantStatus:      http.StatusUnprocessableEntity,
-			wantMessage:     "insufficient balance",
-			wantTransfers:   0,
-			wantSenderInDB:  true,
-			wantSenderBal:   seed["ACC-003"], wantReceiverBal: "ACC-001", wantRecBal: seed["ACC-001"],
+			name:   "receiver not found",
+			sender: "ACC-002", receiver: "ACC-999", amount: 100,
+			wantStatus:    http.StatusNotFound,
+			wantMessage:   "account not found",
+			wantTransfers: 0,
+			wantSenderBal: seed["ACC-002"],
+			wantRecBal:    0,
+		},
+		{
+			name:   "insufficient balance",
+			sender: "ACC-003", receiver: "ACC-001", amount: 1,
+			wantStatus:    http.StatusUnprocessableEntity,
+			wantMessage:   "insufficient balance",
+			wantTransfers: 0,
+			wantSenderBal: seed["ACC-003"], wantRecBal: seed["ACC-001"],
 		},
 	}
 
@@ -365,33 +95,28 @@ func TestIntegration_Validation(t *testing.T) {
 
 		r.checkHTTP(status, tc.wantStatus)
 		r.checkMessage(body.Message, tc.wantMessage)
-		r.checkInt("transfers_in_db",
+		r.checkInt("database.count_created_transaction",
 			scalarInt(t, db, `SELECT COUNT(*) FROM transaction_transfers`),
 			tc.wantTransfers)
-		r.checkInt("ledger_entries_in_db",
+		r.checkInt("database.count_created_ledger",
 			scalarInt(t, db, `SELECT COUNT(*) FROM ledger_entries`),
 			0)
 
-		if tc.wantSenderInDB {
-			if bal, ok := queryBalance(db, tc.sender); ok {
-				r.checkInt(tc.sender+".balance", bal, tc.wantSenderBal)
-			} else {
-				r.check(tc.sender+".balance", "not found in db", fmt.Sprintf("%d", tc.wantSenderBal))
-			}
-		} else {
-			_, ok := queryBalance(db, tc.sender)
-			got := "not found in db"
-			if ok {
-				got = "found in db"
-			}
-			r.check(tc.sender+".exists_in_db", got, "not found in db")
+		label := "database.balance_%s"
+		if bal, ok := queryBalance(db, tc.sender); ok {
+			r.checkInt(fmt.Sprintf(label, tc.sender), bal, tc.wantSenderBal)
 		}
-		if tc.wantReceiverBal != "" {
-			if bal, ok := queryBalance(db, tc.wantReceiverBal); ok {
-				r.checkInt(tc.wantReceiverBal+".balance", bal, tc.wantRecBal)
-			} else {
-				r.check(tc.wantReceiverBal+".balance", "not found in db", fmt.Sprintf("%d", tc.wantRecBal))
+		if bal, ok := queryBalance(db, tc.receiver); ok {
+			r.checkInt(fmt.Sprintf(label, tc.receiver), bal, tc.wantRecBal)
+		}
+
+		seen := map[string]bool{}
+		for _, acc := range []string{tc.sender, tc.receiver} {
+			if acc == "" || seen[acc] {
+				continue
 			}
+			seen[acc] = true
+			r.recordBalance(acc, seed[acc], db)
 		}
 
 		r.print()
@@ -438,8 +163,8 @@ func TestIntegration_IdempotencyConcurrency(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	r.checkInt("5xx_responses", serverErrors, 0)
-	r.checkInt("transfers_in_db",
+	r.checkInt("response.status_5xx", serverErrors, 0)
+	r.checkInt("database.count_success_transfer",
 		scalarInt(t, db, `SELECT COUNT(*) FROM transaction_transfers WHERE reference_id = $1`, key),
 		1)
 	for _, acc := range []struct {
@@ -449,15 +174,20 @@ func TestIntegration_IdempotencyConcurrency(t *testing.T) {
 		{"ACC-001", seed["ACC-001"] - amount},
 		{"ACC-002", seed["ACC-002"] + amount},
 	} {
+		label := "database.balance_%s"
 		if bal, ok := queryBalance(db, acc.name); ok {
-			r.checkInt(acc.name+".balance", bal, acc.want)
+			r.checkInt(fmt.Sprintf(label, acc.name), bal, acc.want)
 		} else {
-			r.check(acc.name+".balance", "account not found in db", fmt.Sprintf("%d", acc.want))
+			r.check(fmt.Sprintf(label, acc.name), "account not found in db", fmt.Sprintf("%d", acc.want))
 		}
 	}
-	r.checkInt("ledger_entries_in_db",
+	r.checkInt("database.count_created_ledger",
 		scalarInt(t, db, `SELECT COUNT(*) FROM ledger_entries`),
 		2)
+
+	for _, acc := range []string{"ACC-001", "ACC-002"} {
+		r.recordBalance(acc, seed[acc], db)
+	}
 
 	r.print()
 }
@@ -471,8 +201,8 @@ func TestIntegration_HighConcurrencyConsistency(t *testing.T) {
 
 	accounts := []string{"ACC-001", "ACC-002", "ACC-003"}
 	const (
-		workers = 300
-		amount  = 1_000
+		workers = 500
+		amount  = 3_000
 	)
 
 	// Top up ACC-003 so it can participate as a sender.
@@ -508,7 +238,7 @@ func TestIntegration_HighConcurrencyConsistency(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	r.checkInt("5xx_responses", serverErrors, 0)
+	r.checkInt("response.status_5xx", serverErrors, 0)
 
 	seedOverride := map[string]int64{"ACC-003": 500_000}
 	var totalActual int64
@@ -525,9 +255,13 @@ func TestIntegration_HighConcurrencyConsistency(t *testing.T) {
 	}
 	r.checkInt("total_money_conserved", totalActual, totalMoney)
 
-	transfers := scalarInt(t, db, `SELECT COUNT(*) FROM transaction_transfers`)
-	ledgers := scalarInt(t, db, `SELECT COUNT(*) FROM ledger_entries`)
-	r.checkInt("ledger_entries_per_transfer (ratio*transfers)", ledgers, transfers*2)
+	expectedFlow := int64(amount * workers)
+	r.checkInt("system.credit_in_vs_moving_amount",
+		scalarInt(t, db, `SELECT COALESCE(SUM(amount), 0) FROM ledger_entries WHERE entry_type = 'credit'`),
+		expectedFlow)
+	r.checkInt("system.debit_out_vs_moving_amount",
+		scalarInt(t, db, `SELECT COALESCE(SUM(amount), 0) FROM ledger_entries WHERE entry_type = 'debit'`),
+		expectedFlow)
 
 	for _, acc := range accounts {
 		delta := scalarInt(t, db, `
@@ -540,11 +274,20 @@ func TestIntegration_HighConcurrencyConsistency(t *testing.T) {
 			base = override
 		}
 		want := base + delta
+		label := "database.balance_%s"
 		if bal, ok := queryBalance(db, acc); ok {
-			r.checkInt(acc+".balance_matches_ledger", bal, want)
+			r.checkInt(fmt.Sprintf(label, acc)+"_ledger", bal, want)
 		} else {
-			r.check(acc+".balance_matches_ledger", "account not found in db", fmt.Sprintf("%d", want))
+			r.check(fmt.Sprintf(label, acc)+"_ledger", "account not found in db", fmt.Sprintf("%d", want))
 		}
+	}
+
+	for _, acc := range accounts {
+		s := seed[acc]
+		if override, ok := seedOverride[acc]; ok {
+			s = override
+		}
+		r.recordBalanceWithFlow(acc, s, db)
 	}
 
 	r.print()
@@ -617,6 +360,11 @@ func TestIntegration_NoDeadlock_Transfers(t *testing.T) {
 	r.checkInt("5xx_responses", serverErrors, 0)
 	r.checkInt("total_money_conserved", total, 200_000_000)
 	r.checkInt("ledger_entries_per_transfer (ratio*transfers)", ledgers, transfers*2)
+
+	// Both accounts were topped up to 100_000_000 before the test.
+	for _, acc := range []string{"ACC-001", "ACC-002"} {
+		r.recordBalance(acc, 100_000_000, db)
+	}
 
 	r.print()
 }

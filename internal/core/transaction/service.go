@@ -67,6 +67,8 @@ func (s *service) CreateTransfer(ctx context.Context, req *httpModel.CreateTrans
 		if sender == nil || receiver == nil {
 			return ErrAccountNotFound
 		}
+
+		// Validation amount balance
 		if sender.Balance < req.Amount {
 			return ErrInsufficientBalance
 		}

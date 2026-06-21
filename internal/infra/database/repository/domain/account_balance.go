@@ -28,7 +28,7 @@ func (r *domainRepository) GetAccountsForUpdate(ctx context.Context, accountNumb
 	}
 
 	query := `
-		SELECT id, account_number, holder_name, balance, currency, status, frozen_at, closed_at, created_at, updated_at
+		SELECT id, account_number, holder_name, balance, currency, status, created_at, updated_at
 		FROM account_balances
 		WHERE account_number IN (` + strings.Join(placeholders, ", ") + `)
 		ORDER BY account_number
@@ -46,7 +46,7 @@ func (r *domainRepository) GetAccountsForUpdate(ctx context.Context, accountNumb
 		var account dao.AccountBalances
 		if err := rows.Scan(
 			&account.ID, &account.AccountNumber, &account.HolderName, &account.Balance,
-			&account.Currency, &account.Status, &account.FrozenAt, &account.ClosedAt,
+			&account.Currency, &account.Status,
 			&account.CreatedAt, &account.UpdatedAt,
 		); err != nil {
 			logger.Error(ctx, "Failed to GetAccountsForUpdate", err)
