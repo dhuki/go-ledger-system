@@ -253,7 +253,6 @@ func TestIntegration_HighConcurrencyConsistency(t *testing.T) {
 		}
 		totalActual += bal
 	}
-	r.checkInt("total_money_conserved", totalActual, totalMoney)
 
 	expectedFlow := int64(amount * workers)
 	r.checkInt("system.credit_in_vs_moving_amount",

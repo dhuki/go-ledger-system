@@ -69,11 +69,11 @@ HTTP Request
 
 `SetNX` atomically writes the idempotency key with a TTL before any database work begins. Only the request that wins the write proceeds; all concurrent duplicates are intercepted here.
 
-| SetNX result                                | What happens                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Unblocked** — key was free               | Proceeds to the database transaction                                                                                                                                                                                                                                                                             |
+| SetNX result                                      | What happens                                                                                                                                                                                                                                                               |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Unblocked** — key was free               | Proceeds to the database transaction                                                                                                                                                                                                                                       |
 | **Blocked — transfer already committed**   | `GetTransferByReferenceID` finds the existing row → returns it as an idempotent replay, no DB write. Isolation level Read Commited also make `tx.GetTransferByReferenceID` will also return commited process and handled by validation if same transfer already exist |
-| **Blocked — transfer still in-processing** | First request still holds the key and has not committed yet → returns`ErrTransferStillProcessing`                                                                                                                                                                                                               |
+| **Blocked — transfer still in-processing** | First request still holds the key and has not committed yet → returns `ErrTransferStillProcessing`                                                                                                                                                                      |
 
 The key is released via `defer Del` once the first request finishes, so callers that received `ErrTransferStillProcessing` can safely retry after a brief wait.
 
@@ -156,7 +156,7 @@ REDIS_TRANSFER_IDEMPOTENCY_TTL=1h
 > ⚠️ **Warning — `POSTGRES_MIGRATION_DIR` must not be changed.** The Dockerfile bakes the migration files into the container at the fixed path `internal/infra/database/repository/domain/migration`. If you change this value the app will fail to find the migration files on startup and will exit immediately.
 
 > ⚠️ **Warning — changing PostgreSQL credentials on an existing volume will crash the app.** PostgreSQL only reads `POSTGRES_DBNAME`, `POSTGRES_USERNAME`, and `POSTGRES_PASSWORD` when initializing a brand-new data directory. If the `postgres_data` Docker volume already exists from a previous `make up`, restarting with different credentials leaves the old ones intact in the volume while the app tries to connect with the new ones — causing an authentication failure and a failed startup. To apply new credentials safely, remove the volume first:
-> 
+>
 > ```bash
 > make down
 > docker volume rm go-ledger-system_postgres_data
@@ -171,11 +171,11 @@ make up
 
 This builds the app image and starts three containers:
 
-| Container                  | Role          | Exposed port    |
-| -------------------------- | ------------- | --------------- |
+| Container                    | Role          | Exposed port        |
+| ---------------------------- | ------------- | ------------------- |
 | `go-ledger-system-psql`    | PostgreSQL 16 | `5432`, `15432` |
-| `go-ledger-system-redis`   | Redis 7       | `6379`          |
-| `go-ledger-system-service` | Application   | `8080`          |
+| `go-ledger-system-redis`   | Redis 7       | `6379`            |
+| `go-ledger-system-service` | Application   | `8080`            |
 
 The app waits for PostgreSQL and Redis health checks to pass before starting. Database migrations run automatically on startup.
 
@@ -225,16 +225,16 @@ curl -s -X POST http://localhost:8080/api/v1/transfer \
 
 **Request headers**
 
-| Header              | Required | Description                                                              |
-| ------------------- | -------- | ------------------------------------------------------------------------ |
-| `Content-Type`      | Yes      | Must be`application/json`                                                |
+| Header                | Required | Description                                                              |
+| --------------------- | -------- | ------------------------------------------------------------------------ |
+| `Content-Type`      | Yes      | Must be `application/json`                                             |
 | `X-Idempotency-Key` | Yes      | Unique key per transfer intent; prevents duplicate processing on retries |
 | `X-Trace-ID`        | Optional | UUID for request tracing across logs                                     |
 
 **Request body**
 
-| Field              | Type    | Description                                                                |
-| ------------------ | ------- | -------------------------------------------------------------------------- |
+| Field                | Type    | Description                                                                |
+| -------------------- | ------- | -------------------------------------------------------------------------- |
 | `sender_account`   | string  | Account number to debit                                                    |
 | `receiver_account` | string  | Account number to credit                                                   |
 | `amount`           | integer | Transfer amount in the smallest currency unit — must be greater than zero |
@@ -253,11 +253,11 @@ curl -s -X POST http://localhost:8080/api/v1/transfer \
 
 **Error responses**
 
-| HTTP status                | Cause                                                      |
-| -------------------------- | ---------------------------------------------------------- |
+| HTTP status                  | Cause                                                        |
+| ---------------------------- | ------------------------------------------------------------ |
 | `400 Bad Request`          | `amount` ≤ 0, or sender and receiver are the same account |
-| `404 Not Found`            | Sender or receiver account does not exist                  |
-| `422 Unprocessable Entity` | Sender has insufficient balance---                         |
+| `404 Not Found`            | Sender or receiver account does not exist                    |
+| `422 Unprocessable Entity` | Sender has insufficient balance                              |
 
 ## 3. Running Integration Tests
 
@@ -305,8 +305,8 @@ DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=
 
 ### What the tests cover
 
-| Test                                         | Description                                                                                      |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Test                                           | Description                                                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `TestIntegration_Validation`                 | Rejects zero amount, self-transfer, unknown sender, and insufficient balance                     |
 | `TestIntegration_IdempotencyConcurrency`     | 50 concurrent requests sharing one idempotency key — exactly one transfer must be persisted     |
 | `TestIntegration_HighConcurrencyConsistency` | 300 concurrent unique transfers across 3 accounts — total money in the system must be conserved |
@@ -342,6 +342,7 @@ CASE: zero amount transfer
     sender               = ACC-001
     receiver             = ACC-002
     amount               = 0
+    idempotency_key      = 531f8b23-ca0e-472d-93b4-9986313e1bda
 
   RESPONSE:
     response.status        got: 400                             expected: 400
@@ -350,7 +351,9 @@ CASE: zero amount transfer
   BALANCE STATE:
     account       seed                actual              delta
     ACC-001       10000000            10000000            +0
+
     ACC-002       5000000             5000000             +0
+
 
   VALIDATION:
     case                                got                expected           result
@@ -370,6 +373,7 @@ CASE: self transfer
     sender               = ACC-001
     receiver             = ACC-001
     amount               = 100
+    idempotency_key      = cbef267a-9e17-42f7-b863-623bb573f018
 
   RESPONSE:
     response.status        got: 400                             expected: 400
@@ -379,12 +383,14 @@ CASE: self transfer
     account       seed                actual              delta
     ACC-001       10000000            10000000            +0
 
+
   VALIDATION:
     case                                got                expected           result
     response.status                     400                400                PASS
     response.message                    cannot transfer to the same account cannot transfer to the same account PASS
     database.count_created_transaction  0                  0                  PASS
     database.count_created_ledger       0                  0                  PASS
+    database.balance_ACC-001            10000000           10000000           PASS
     database.balance_ACC-001            10000000           10000000           PASS
 
   OVERALL: PASS
@@ -396,6 +402,7 @@ CASE: sender not found
     sender               = ACC-999
     receiver             = ACC-002
     amount               = 100
+    idempotency_key      = 8b123523-9c80-49a8-b220-76f41f38742c
 
   RESPONSE:
     response.status        got: 404                             expected: 404
@@ -405,6 +412,7 @@ CASE: sender not found
     account       seed                actual              delta
     ACC-999       0                   not found           -
     ACC-002       5000000             5000000             +0
+
 
   VALIDATION:
     case                                got                expected           result
@@ -423,6 +431,7 @@ CASE: receiver not found
     sender               = ACC-002
     receiver             = ACC-999
     amount               = 100
+    idempotency_key      = 1cf6e5d1-a622-484c-a0c3-756ea2e7ca57
 
   RESPONSE:
     response.status        got: 404                             expected: 404
@@ -431,6 +440,7 @@ CASE: receiver not found
   BALANCE STATE:
     account       seed                actual              delta
     ACC-002       5000000             5000000             +0
+
     ACC-999       0                   not found           -
 
   VALIDATION:
@@ -450,6 +460,7 @@ CASE: insufficient balance
     sender               = ACC-003
     receiver             = ACC-001
     amount               = 1
+    idempotency_key      = 1407bd44-6444-4880-aa30-c036c227ee89
 
   RESPONSE:
     response.status        got: 422                             expected: 422
@@ -458,7 +469,9 @@ CASE: insufficient balance
   BALANCE STATE:
     account       seed                actual              delta
     ACC-003       0                   0                   +0
+
     ACC-001       10000000            10000000            +0
+
 
   VALIDATION:
     case                                got                expected           result
@@ -471,7 +484,7 @@ CASE: insufficient balance
 
   OVERALL: PASS
 --------------------------------------------------------------------
---- PASS: TestIntegration_Validation (0.36s)
+--- PASS: TestIntegration_Validation (0.32s)
 ```
 
 </details>
@@ -499,12 +512,16 @@ CASE: 50 concurrent requests — same idempotency key
     sender               = ACC-001
     receiver             = ACC-002
     amount               = 1000000
-    idempotency_key      = idem-1782026078359813000
+    idempotency_key      = idem-1782034039067899000
 
   BALANCE STATE:
     account       seed                actual              delta
     ACC-001       10000000            9000000             -1000000
+                  credit_in: 0        debit_out: 1000000
+
     ACC-002       5000000             6000000             +1000000
+                  credit_in: 1000000  debit_out: 0
+
 
   VALIDATION:
     case                                got                expected           result
@@ -516,7 +533,7 @@ CASE: 50 concurrent requests — same idempotency key
 
   OVERALL: PASS
 --------------------------------------------------------------------
---- PASS: TestIntegration_IdempotencyConcurrency (0.10s)
+--- PASS: TestIntegration_IdempotencyConcurrency (0.09s)
 ```
 
 </details>
@@ -558,10 +575,10 @@ CASE: 500 concurrent unique transfers across 3 accounts
     ACC-003       500000              503000              +3000
                   credit_in: 501000   debit_out: 498000
 
+
   VALIDATION:
     case                                got                expected           result
     response.status_5xx                 0                  0                  PASS
-    total_money_conserved               15500000           15500000           PASS
     system.credit_in_vs_moving_amount   1500000            1500000            PASS
     system.debit_out_vs_moving_amount   1500000            1500000            PASS
     database.balance_ACC-001_ledger     9997000            9997000            PASS
@@ -570,7 +587,7 @@ CASE: 500 concurrent unique transfers across 3 accounts
 
   OVERALL: PASS
 --------------------------------------------------------------------
---- PASS: TestIntegration_HighConcurrencyConsistency (1.61s)
+--- PASS: TestIntegration_HighConcurrencyConsistency (1.74s)
 ```
 
 </details>
@@ -591,31 +608,35 @@ CASE: 500 concurrent unique transfers across 3 accounts
 
 === TestIntegration_NoDeadlock_Transfers ===
 --------------------------------------------------------------------
-CASE: 150 reciprocal pairs ACC-001<->ACC-002 (total 300 goroutines)
+CASE: 300 reciprocal pairs ACC-001<->ACC-002 (total 600 goroutines)
 
   INPUT:
-    pairs                = 150
+    pairs                = 300
     amount_each          = 100
-    ACC-001.balance_before = 100000000
-    ACC-002.balance_before = 100000000
+    balance.ACC-001      = 100000000
+    balance.ACC-002      = 100000000
 
   BALANCE STATE:
     account       seed                actual              delta
     ACC-001       100000000           100000000           +0
+                  credit_in: 30000    debit_out: 30000
+
     ACC-002       100000000           100000000           +0
+                  credit_in: 30000    debit_out: 30000
+
 
   VALIDATION:
     case                                got                expected           result
-    5xx_responses                       0                  0                  PASS
-    total_money_conserved               200000000          200000000          PASS
-    ledger_entries_per_transfer (ratio*transfers) 600       600                PASS
+    response.status_5xx                 0                  0                  PASS
+    database.count_created_ledger       1200               1200               PASS
+    database.balance_ACC-001_ledger     100000000          100000000          PASS
+    database.balance_ACC-002_ledger     100000000          100000000          PASS
 
   OVERALL: PASS
 --------------------------------------------------------------------
---- PASS: TestIntegration_NoDeadlock_Transfers (1.03s)
+--- PASS: TestIntegration_NoDeadlock_Transfers (3.67s)
 PASS
-ok      github.com/dhuki/go-ledger-system/scripts/integration   3.685s
+ok      github.com/dhuki/go-ledger-system/scripts/integration   6.486s
 ```
 
 </details>
-
