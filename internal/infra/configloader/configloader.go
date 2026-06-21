@@ -45,7 +45,7 @@ func LoadConfig() {
 		fileList = envVal
 	}
 
-	godotenv.Overload(strings.Split(fileList, ",")...)
+	godotenv.Load(strings.Split(fileList, ",")...)
 
 	appConfig = make(map[string]confValue, 0)
 	for key, value := range defaultConfig {
