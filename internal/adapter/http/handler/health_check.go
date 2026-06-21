@@ -18,17 +18,7 @@ func NewHealthCheckHandler(service healthcheck.Service) *healthcheckHandler {
 
 func (h *healthcheckHandler) RegisterRoute(g *gin.RouterGroup) {
 	healthGroup := g.Group("/health")
-	healthGroup.GET("", h.CheckHealth, middleware.WithLogReqBody())
-	healthGroup.POST("/echo", middleware.WithLogReqBody(), h.Echo)
-}
-
-func (h *healthcheckHandler) Echo(c *gin.Context) {
-	var payload any
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, payload)
+	healthGroup.GET("", middleware.WithLogReqBody(), h.CheckHealth)
 }
 
 func (h *healthcheckHandler) CheckHealth(c *gin.Context) {
