@@ -4,7 +4,115 @@ A backend service that manages bank ledger records using double-entry bookkeepin
 
 ---
 
-## 1. Running with Docker
+## 1. Decision Flow Architecture
+
+### CAP Theorem — Consistency over Availability
+
+A bank ledger has zero tolerance for balance drift. A transfer that debits without crediting, or that is applied twice, is a fundamental failure. Under the CAP theorem this system explicitly chooses **Consistency over Availability**: a request will be rejected or made to wait rather than risk an incorrect balance.
+
+---
+
+### Consistency Strategy
+
+Two layers of pessimistic control enforce exactly-once semantics for every transfer.
+
+```
+HTTP Request
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  LAYER 1 — Redis SetNX  (service layer)                     │
+  │  Atomically claims the idempotency key before any DB work.  │
+  │  Only the winner proceeds; all concurrent duplicates stop   │
+  │  here and never touch the database.                         │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+         SetNX blocked              SetNX unblocked
+              │                             │
+  ┌───────────▼──────────────┐              │
+  │  GetTransferByReferenceID│              │
+  ├──────────────────────────┤              │
+  │ Found → return existing  │              │
+  │ Not found (in-flight)    │              │
+  │   → ErrStillProcessing   │              │
+  └───────────────────────── ┘              │
+                                            ▼
+                              ┌─────────────────────────────┐
+                              │  BEGIN TRANSACTION          │
+                              │                             │
+                              │  LAYER 2 — SELECT FOR UPDATE│
+                              │  ORDER BY account_number    │
+                              │  (row-level pessimistic lock│
+                              │   on both accounts at once) │
+                              │                             │
+                              │  Validate sender balance    │
+                              │                             │
+                              │  GetTransferByReferenceID   │
+                              │  (safety re-check under lock│
+                              │   guards against Redis TTL  │
+                              │   expiry edge case)         │
+                              │                             │
+                              │  UPDATE account balances    │
+                              │  INSERT transfer record     │
+                              │  INSERT ledger entries (×2) │
+                              │                             │
+                              │  COMMIT                     │
+                              └─────────────────────────────┘
+                                            │
+                                    defer Del Redis key
+```
+
+---
+
+#### Layer 1 — Redis `SetNX` (service layer)
+
+`SetNX` atomically writes the idempotency key with a TTL before any database work begins. Only the request that wins the write proceeds; all concurrent duplicates are intercepted here.
+
+| SetNX result                                | What happens                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Unblocked** — key was free               | Proceeds to the database transaction                                                                                                                                                                                                                                                                             |
+| **Blocked — transfer already committed**   | `GetTransferByReferenceID` finds the existing row → returns it as an idempotent replay, no DB write. Isolation level Read Commited also make `tx.GetTransferByReferenceID` will also return commited process and handled by validation if same transfer already exist |
+| **Blocked — transfer still in-processing** | First request still holds the key and has not committed yet → returns`ErrTransferStillProcessing`                                                                                                                                                                                                               |
+
+The key is released via `defer Del` once the first request finishes, so callers that received `ErrTransferStillProcessing` can safely retry after a brief wait.
+
+---
+
+#### Layer 2 — `SELECT FOR UPDATE ORDER BY account_number` (repository layer)
+
+Inside the database transaction, both accounts are locked in a single query using `FOR UPDATE`. This is the fallback guard for any scenario where Redis is bypassed or the key expires early.
+
+```sql
+SELECT ... FROM account_balances
+WHERE account_number IN ($1, $2)
+ORDER BY account_number
+FOR UPDATE
+```
+
+The `ORDER BY account_number` is **the deadlock prevention mechanism**. Every transfer regardless of direction acquires row locks in the same alphabetical order.
+
+**Without ordering**, A→B and B→A transfers deadlock:
+
+```
+TX1 (A→B): locks ACC-001, waits for ACC-002
+TX2 (B→A): locks ACC-002, waits for ACC-001  ← circular wait → deadlock
+```
+
+**With `ORDER BY account_number`**, both transactions acquire locks in the same sequence:
+
+```
+TX1 (A→B): locks ACC-001 first, then ACC-002
+TX2 (B→A): locks ACC-001 first (waits), then ACC-002  ← no circular wait → no deadlock
+```
+
+#### Safety re-check under the row lock
+
+After acquiring the row locks, the service runs a second `GetTransferByReferenceID` inside the transaction. This handles a narrow edge case: if the Redis key TTL expires between the `SetNX` claim and the database commit, a second concurrent request may win its own `SetNX` and reach the transaction. The under-lock idempotency check catches this before any writes occur and returns the existing result rather than double-processing.
+
+---
+
+## 2. Running with Docker
 
 ### Prepare configuration
 
@@ -48,7 +156,7 @@ REDIS_TRANSFER_IDEMPOTENCY_TTL=1h
 > ⚠️ **Warning — `POSTGRES_MIGRATION_DIR` must not be changed.** The Dockerfile bakes the migration files into the container at the fixed path `internal/infra/database/repository/domain/migration`. If you change this value the app will fail to find the migration files on startup and will exit immediately.
 
 > ⚠️ **Warning — changing PostgreSQL credentials on an existing volume will crash the app.** PostgreSQL only reads `POSTGRES_DBNAME`, `POSTGRES_USERNAME`, and `POSTGRES_PASSWORD` when initializing a brand-new data directory. If the `postgres_data` Docker volume already exists from a previous `make up`, restarting with different credentials leaves the old ones intact in the volume while the app tries to connect with the new ones — causing an authentication failure and a failed startup. To apply new credentials safely, remove the volume first:
->
+> 
 > ```bash
 > make down
 > docker volume rm go-ledger-system_postgres_data
@@ -62,7 +170,6 @@ make up
 ```
 
 This builds the app image and starts three containers:
-
 
 | Container                  | Role          | Exposed port    |
 | -------------------------- | ------------- | --------------- |
@@ -118,7 +225,6 @@ curl -s -X POST http://localhost:8080/api/v1/transfer \
 
 **Request headers**
 
-
 | Header              | Required | Description                                                              |
 | ------------------- | -------- | ------------------------------------------------------------------------ |
 | `Content-Type`      | Yes      | Must be`application/json`                                                |
@@ -126,7 +232,6 @@ curl -s -X POST http://localhost:8080/api/v1/transfer \
 | `X-Trace-ID`        | Optional | UUID for request tracing across logs                                     |
 
 **Request body**
-
 
 | Field              | Type    | Description                                                                |
 | ------------------ | ------- | -------------------------------------------------------------------------- |
@@ -148,15 +253,13 @@ curl -s -X POST http://localhost:8080/api/v1/transfer \
 
 **Error responses**
 
-
 | HTTP status                | Cause                                                      |
 | -------------------------- | ---------------------------------------------------------- |
 | `400 Bad Request`          | `amount` ≤ 0, or sender and receiver are the same account |
 | `404 Not Found`            | Sender or receiver account does not exist                  |
 | `422 Unprocessable Entity` | Sender has insufficient balance---                         |
 
-
-## 2. Running Integration Tests
+## 3. Running Integration Tests
 
 Integration tests run against live Docker containers and verify end-to-end behaviour including idempotency, concurrency consistency, and deadlock prevention.
 
@@ -164,8 +267,6 @@ Integration tests run against live Docker containers and verify end-to-end behav
 
 - All Docker containers must be running (`make up`).
 - The test uses port `15432` (the extra PostgreSQL port exposed by Docker Compose) to connect directly to the database for assertions and state resets.
-
-> **Warning:** The credentials in `DOCKER_PSQL_DSN` (`user`, `password`, `dbname`) must exactly match the values you set in `.env` for `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DBNAME`. A mismatch will cause the test to fail to connect to the database inside the Docker container. Double-check your `.env` before running.
 
 ### Run
 
@@ -180,8 +281,29 @@ DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=
   go test -v -count=1 -timeout=60s ./scripts/integration/...
 ```
 
-### What the tests cover
+To run a single test suite, append `-run <TestName>`:
 
+```bash
+# Validation only
+DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable" \
+  go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_Validation
+
+# Idempotency & concurrency only
+DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable" \
+  go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_IdempotencyConcurrency
+
+# High-concurrency consistency only
+DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable" \
+  go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_HighConcurrencyConsistency
+
+# Deadlock prevention only
+DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable" \
+  go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_NoDeadlock_Transfers
+```
+
+> ⚠️ **Warning:** The credentials in `DOCKER_PSQL_DSN` (`user`, `password`, `dbname`) must exactly match the values you set in `.env` for `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DBNAME`. A mismatch will cause the test to fail to connect to the database inside the Docker container. Double-check your `.env` before running.
+
+### What the tests cover
 
 | Test                                         | Description                                                                                      |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -190,11 +312,11 @@ DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=
 | `TestIntegration_HighConcurrencyConsistency` | 300 concurrent unique transfers across 3 accounts — total money in the system must be conserved |
 | `TestIntegration_NoDeadlock_Transfers`       | 150 reciprocal A→B / B→A pairs fired simultaneously — no deadlocks, no 5xx responses          |
 
-> **Warning:** Each test truncates `ledger_entries` and `transaction_transfers` and resets account balances before running. Do not point `DOCKER_PSQL_DSN` at a database with data you want to keep.
+> ⚠️ **Warning:** Each test truncates `ledger_entries` and `transaction_transfers` and resets account balances before running. Do not point `DOCKER_PSQL_DSN` at a database with data you want to keep.
 
 ---
 
-## 3. Integration Test Results
+## 4. Integration Test Results
 
 Run with `make test-integration`. All four suites pass. Screenshots are provided alongside the captured output for each suite.
 
@@ -496,3 +618,4 @@ ok      github.com/dhuki/go-ledger-system/scripts/integration   3.685s
 ```
 
 </details>
+

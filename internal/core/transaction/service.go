@@ -52,6 +52,7 @@ func (s *service) CreateTransfer(ctx context.Context, req *httpModel.CreateTrans
 			return &httpModel.CreateTransferResponse{TransactionID: existing.ID}, nil
 		}
 		// In-flight: the first request holds the key but hasn't committed yet.
+		logger.Info(ctx, "Transfer is still processing, ignored")
 		return nil, ErrTranferStillProcessing
 	}
 

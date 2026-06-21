@@ -116,7 +116,7 @@ func TestIntegration_Validation(t *testing.T) {
 				continue
 			}
 			seen[acc] = true
-			r.recordBalance(acc, seed[acc], db)
+			r.recordBalanceWithFlow(acc, seed[acc], db)
 		}
 
 		r.print()
@@ -186,7 +186,7 @@ func TestIntegration_IdempotencyConcurrency(t *testing.T) {
 		2)
 
 	for _, acc := range []string{"ACC-001", "ACC-002"} {
-		r.recordBalance(acc, seed[acc], db)
+		r.recordBalanceWithFlow(acc, seed[acc], db)
 	}
 
 	r.print()
@@ -301,19 +301,21 @@ func TestIntegration_NoDeadlock_Transfers(t *testing.T) {
 	db := openDB(t)
 	resetState(t, db)
 
+	baseBalance := 100000000
+
 	// Top up both accounts so neither runs dry — we want to exercise the lock
 	// path for every request, not hit insufficient-balance errors.
 	if _, err := db.Exec(`UPDATE account_balances SET balance = 100000000 WHERE account_number IN ('ACC-001','ACC-002')`); err != nil {
 		t.Fatalf("top up: %v", err)
 	}
-	const pairs = 150
+	const workers = 300
 
 	fmt.Printf("\n=== TestIntegration_NoDeadlock_Transfers ===\n")
-	r := newReport(t, fmt.Sprintf("%d reciprocal pairs ACC-001<->ACC-002 (total %d goroutines)", pairs, pairs*2))
-	r.input("pairs", fmt.Sprintf("%d", pairs))
+	r := newReport(t, fmt.Sprintf("%d reciprocal pairs ACC-001<->ACC-002 (total %d goroutines)", workers, workers*2))
+	r.input("pairs", fmt.Sprintf("%d", workers))
 	r.input("amount_each", "100")
-	r.input("ACC-001.balance_before", "100000000")
-	r.input("ACC-002.balance_before", "100000000")
+	r.input("balance.ACC-001", fmt.Sprint(baseBalance))
+	r.input("balance.ACC-002", fmt.Sprint(baseBalance))
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -329,7 +331,7 @@ func TestIntegration_NoDeadlock_Transfers(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	for i := range pairs {
+	for i := range workers {
 		wg.Add(2)
 		go fire("ACC-001", "ACC-002", i)
 		go fire("ACC-002", "ACC-001", i)
@@ -347,7 +349,8 @@ func TestIntegration_NoDeadlock_Transfers(t *testing.T) {
 	}
 
 	var total int64
-	for _, acc := range []string{"ACC-001", "ACC-002"} {
+	accounts := []string{"ACC-001", "ACC-002"}
+	for _, acc := range accounts {
 		if bal, ok := queryBalance(db, acc); ok {
 			total += bal
 		} else {
@@ -357,13 +360,28 @@ func TestIntegration_NoDeadlock_Transfers(t *testing.T) {
 	transfers := scalarInt(t, db, `SELECT COUNT(*) FROM transaction_transfers`)
 	ledgers := scalarInt(t, db, `SELECT COUNT(*) FROM ledger_entries`)
 
-	r.checkInt("5xx_responses", serverErrors, 0)
-	r.checkInt("total_money_conserved", total, 200_000_000)
-	r.checkInt("ledger_entries_per_transfer (ratio*transfers)", ledgers, transfers*2)
+	r.checkInt("response.status_5xx", serverErrors, 0)
+	r.checkInt("database.count_created_ledger", ledgers, transfers*2)
+
+	for _, acc := range accounts {
+		delta := scalarInt(t, db, `
+			SELECT COALESCE(SUM(CASE WHEN le.entry_type = 'credit' THEN le.amount ELSE -le.amount END), 0)
+			FROM ledger_entries le
+			JOIN account_balances ab ON ab.id = le.account_id
+			WHERE ab.account_number = $1`, acc)
+
+		want := int64(baseBalance) + delta
+		label := "database.balance_%s"
+		if bal, ok := queryBalance(db, acc); ok {
+			r.checkInt(fmt.Sprintf(label, acc)+"_ledger", bal, want)
+		} else {
+			r.check(fmt.Sprintf(label, acc)+"_ledger", "account not found in db", fmt.Sprintf("%d", want))
+		}
+	}
 
 	// Both accounts were topped up to 100_000_000 before the test.
 	for _, acc := range []string{"ACC-001", "ACC-002"} {
-		r.recordBalance(acc, 100_000_000, db)
+		r.recordBalanceWithFlow(acc, 100_000_000, db)
 	}
 
 	r.print()
