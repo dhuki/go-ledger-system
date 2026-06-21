@@ -270,6 +270,8 @@ Integration tests run against live Docker containers and verify end-to-end behav
 
 ### Run
 
+#### macOS / Linux
+
 ```bash
 make test-integration
 ```
@@ -299,6 +301,67 @@ DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=
 # Deadlock prevention only
 DOCKER_PSQL_DSN="host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable" \
   go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_NoDeadlock_Transfers
+```
+
+#### Windows
+
+`make` and inline environment variable syntax are not available in native Windows shells. Use one of the options below.
+
+**Option 1 — Git Bash or WSL2 (recommended)**
+
+If you have [Git for Windows](https://git-scm.com/download/win) (Git Bash) or WSL2, the macOS/Linux commands above work unchanged inside those shells.
+
+**Option 2 — PowerShell**
+
+Start all services first (no `make` required):
+
+```powershell
+docker-compose up -d --build
+```
+
+Run all integration tests:
+
+```powershell
+$env:DOCKER_PSQL_DSN = "host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable"
+go test -v -count=1 -timeout=60s ./scripts/integration/...
+```
+
+Run a single test suite:
+
+```powershell
+$env:DOCKER_PSQL_DSN = "host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable"
+
+# Validation only
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_Validation
+
+# Idempotency & concurrency only
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_IdempotencyConcurrency
+
+# High-concurrency consistency only
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_HighConcurrencyConsistency
+
+# Deadlock prevention only
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_NoDeadlock_Transfers
+```
+
+**Option 3 — Command Prompt (cmd.exe)**
+
+```cmd
+docker-compose up -d --build
+```
+
+```cmd
+set DOCKER_PSQL_DSN=host=localhost port=15432 dbname=<dbname> user=<user> password=<password> sslmode=disable
+go test -v -count=1 -timeout=60s ./scripts/integration/...
+```
+
+Run a single test suite (the `set` line carries over within the same cmd session):
+
+```cmd
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_Validation
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_IdempotencyConcurrency
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_HighConcurrencyConsistency
+go test -v -count=1 -timeout=60s ./scripts/integration/... -run TestIntegration_NoDeadlock_Transfers
 ```
 
 > ⚠️ **Warning:** The credentials in `DOCKER_PSQL_DSN` (`user`, `password`, `dbname`) must exactly match the values you set in `.env` for `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and `POSTGRES_DBNAME`. A mismatch will cause the test to fail to connect to the database inside the Docker container. Double-check your `.env` before running.
